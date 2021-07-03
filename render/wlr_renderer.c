@@ -20,6 +20,7 @@
 #if WLR_HAS_GLES2_RENDERER
 #include <wlr/render/egl.h>
 #include <wlr/render/gles2.h>
+#include "render/egl.h"
 #endif
 
 #if WLR_HAS_VULKAN_RENDERER
@@ -30,6 +31,7 @@
 #include "render/pixel_format.h"
 #include "render/wlr_renderer.h"
 #include "util/env.h"
+#include "backend/drm/drm.h"
 
 void wlr_renderer_init(struct wlr_renderer *renderer,
 		const struct wlr_renderer_impl *impl) {
@@ -52,6 +54,15 @@ void wlr_renderer_destroy(struct wlr_renderer *r) {
 	if (!r) {
 		return;
 	}
+
+#if WLR_HAS_GLES2_RENDERER
+	struct wlr_egl *egl = wlr_gles2_renderer_get_egl(r);
+
+	if (egl->procs.eglUnbindWaylandDisplayWL && egl->wl_display) {
+		egl->procs.eglUnbindWaylandDisplayWL(egl->display,
+				egl->wl_display);
+	}
+#endif
 
 	assert(!r->rendering);
 
@@ -216,6 +227,53 @@ bool wlr_renderer_read_pixels(struct wlr_renderer *r, uint32_t fmt,
 bool wlr_renderer_init_wl_shm(struct wlr_renderer *r,
 		struct wl_display *wl_display) {
 	return wlr_shm_create_with_renderer(wl_display, 1, r) != NULL;
+
+	if (drm_is_eglstreams(wlr_renderer_get_drm_fd(r))) {
+		wlr_log(WLR_INFO, "EGLStreams: binding wl_disply to EGL and initializing eglstream controller...");
+		struct wlr_egl *egl = wlr_gles2_renderer_get_egl(r);
+		assert(egl->procs.eglBindWaylandDisplayWL);
+		EGLBoolean res = egl->procs.eglBindWaylandDisplayWL(egl->display, wl_display);
+		egl->wl_display = wl_display;
+		assert(res == EGL_TRUE);
+		init_eglstream_controller(wl_display);
+	}
+
+	if (wl_display_init_shm(wl_display) != 0) {
+		wlr_log(WLR_ERROR, "Failed to initialize wl_shm");
+		return false;
+	}
+
+	size_t len;
+	const uint32_t *formats = wlr_renderer_get_shm_texture_formats(r, &len);
+	if (formats == NULL) {
+		wlr_log(WLR_ERROR, "Failed to initialize wl_shm: "
+			"cannot get renderer formats");
+		return false;
+	}
+
+	bool argb8888 = false, xrgb8888 = false;
+	for (size_t i = 0; i < len; ++i) {
+		// ARGB8888 and XRGB8888 must be supported and are implicitly
+		// advertised by wl_display_init_shm
+		enum wl_shm_format fmt = convert_drm_format_to_wl_shm(formats[i]);
+		switch (fmt) {
+		case WL_SHM_FORMAT_ARGB8888:
+			argb8888 = true;
+			break;
+		case WL_SHM_FORMAT_XRGB8888:
+			xrgb8888 = true;
+			break;
+		default:
+			if (wl_display_add_shm_format(wl_display, fmt) == NULL) {
+				wlr_log(WLR_ERROR, "Failed to initialize wl_shm: "
+					"failed to add format");
+				return false;
+			}
+		}
+	}
+	assert(argb8888 && xrgb8888);
+
+	return true;
 }
 
 bool wlr_renderer_init_wl_display(struct wlr_renderer *r,
@@ -234,6 +292,7 @@ bool wlr_renderer_init_wl_display(struct wlr_renderer *r,
 		}
 
 		if (wlr_linux_dmabuf_v1_create_with_renderer(wl_display, 4, r) == NULL) {
+		if (wlr_linux_dmabuf_v1_create(wl_display, r) == NULL) {
 			return false;
 		}
 	}
